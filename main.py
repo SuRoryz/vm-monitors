@@ -41,26 +41,22 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+@app.route('/vms', methods=['GET'])
+def vms():
+    if DBHelper.authToken(session['token']):
+        return app.send_static_file('index.html')
+    return redirect('/login')
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def index(path):
-    return app.send_static_file('placeholder.jpg')
+    return app.send_static_file('idnex.html')
 
 @app.errorhandler(404)
 def not_found(e):
-    return app.send_static_file('placeholder.jpg')
+    return app.send_static_file('idnex.html')
 
-@app.route('/profile', methods=['GET'])
-def profile():
-    if DBHelper.authToken(session['token']):
-        return app.send_static_file('index.html')
-    return redirect('/login')
-
-@app.route('/task/<id>', methods=['GET'])
-def tour(id):
-    if DBHelper.authToken(session['token']):
-        return app.send_static_file('index.html')
-    return redirect('/login')
 @app.route('/api/login', methods=['POST'])
 def login():
     """Используется для авторизации
@@ -317,7 +313,8 @@ def add_vm(name, os_):
 def delete_vm(id):
     if user := DBHelper.authToken(session['token']):
         if vm := VM.query.get(id):
-            if VM.owner == user.id:
+            print(vm.owner, user.id)
+            if vm.owner == user.id:
                 DBHelper.deleteVM(id)
 
                 socketio.emit("ping", rooms=["/vms"])
@@ -357,6 +354,8 @@ def get_all_vms():
                 "id": vm.id,
                 "name": vm.name,
                 "os": vm.os,
+                "hooked": str(vm.id) in QMP_CLIENTS,
+                "vm_type": vm.vm_type,
                 "last_dump": "dumps/" + str(vm.id) + "last_dump.png",
                 "running": vm.running
             } for vm in VMs] })
@@ -399,7 +398,7 @@ def run_vm(id):
 
                 socketio.emit("ping", rooms=["/vms"])
 
-                return jsonify({'message': 'VM started', 'status': 1})
+                return jsonify({'message': 'VM started', 'status': 1, "need_hook": vm.vm_type == "qemu"})
 
 @app.route('/api/vm/stop/<id>', methods=['POST'])
 def stop_vm(id):
@@ -408,29 +407,50 @@ def stop_vm(id):
             if vm.owner == user.id:
                 global QMP_CLIENTS
 
-                if str(id) in QMP_CLIENTS:
-                    cl = QMP_CLIENTS[str(id)]["client"]
-                    res = cl.cmd("quit")
-                else:
+                if vm.vm_type == "qemu":
                     try:
-                        cl = QEMUMonitorProtocol((vm.ip, vm.socket))
-                        cl.connect()
-                        cl.cmd("quit")
-                        cl.close()
+                        if str(id) in QMP_CLIENTS:
+                            cl = QMP_CLIENTS[str(id)]["client"]
+                            res = cl.cmd("quit")
+                        else:
+                            try:
+                                cl = QEMUMonitorProtocol((vm.ip, vm.socket))
+                                cl.connect()
+                                cl.cmd("quit")
+                                cl.close()
+                            except:
+                                pass
                     except:
-                        pass
+                        if str(id) in TIMERS:
+                            TIMERS[str(id)].running = False
+                    
+                        if str(id) in QMP_CLIENTS:
+                            QMP_CLIENTS[str(id)]["client"].close()
+                        
+                        if str(id) in QMP_CLIENTS:
+                            del QMP_CLIENTS[str(id)]
 
-                vm.running = True
-                db.session.commit()
+                        vm.running = False
+                        db.session.commit()
 
-                if str(id) in TIMERS:
-                    TIMERS[str(id)].running = False
-                
-                if str(id) in QMP_CLIENTS:
-                    QMP_CLIENTS[str(id)]["client"].close()
-                
-                if str(id) in QMP_CLIENTS:
-                    del QMP_CLIENTS[str(id)]
+                        return jsonify({'message': 'Ошибка. Аварийное отключение', 'status': 0})
+
+                    if str(id) in TIMERS:
+                        TIMERS[str(id)].running = False
+                    
+                    if str(id) in QMP_CLIENTS:
+                        QMP_CLIENTS[str(id)]["client"].close()
+                    
+                    if str(id) in QMP_CLIENTS:
+                        del QMP_CLIENTS[str(id)]
+                if vm.vm_type == "docker":
+                    try:
+                        stop_docker(vm.ip, vm.socket, vm.ssh_pass, vm.ssh_user, ip_qmp=vm.ip_qmp, path=vm.path, vm_type=vm.vm_type)
+                    except:
+                        vm.running = False
+                        db.session.commit()
+
+                        return jsonify({'message': 'Ошибка. Аварийное отключение', 'status': 0})
 
                 vm.running = False
                 db.session.commit()
@@ -447,16 +467,26 @@ def hook_vm(id):
         if vm := VM.query.get(id):
             if vm.owner == user.id:
                 global QMP_CLIENTS
+
+                if str(id) in QMP_CLIENTS:
+                    QMP_CLIENTS[str(id)]["client"].close()
+                    del QMP_CLIENTS[str(id)]
+
                 cl = QEMUMonitorProtocol((vm.ip, int(vm.socket)))
                 print(vm.ip, vm.socket)
+                
+                try:
+                    cl.connect()
+                except:
+                    return jsonify({'message': 'Ошибка подключения', 'status': 0})
 
                 QMP_CLIENTS[str(id)] = {
                     "client": cl,
                     "VM": vm
                 }
+                socketio.emit("ping", rooms=["/vms"])
 
-                cl.connect()
-                return jsonify({'message': 'VM started', 'status': 1})
+                return jsonify({'message': 'Подключено', 'status': 1})
 
 @app.route('/api/vm/getInfo/<id>', methods=['POST'])
 def info_vm(id):
@@ -466,6 +496,43 @@ def info_vm(id):
                 global QMP_CLIENTS
                 cl = QMP_CLIENTS[str(vm.id)]["client"]
                 res = cl.cmd("query-status")
+
+                return jsonify({'message': 'VM started', 'status': 1, 'result': res})
+
+@app.route('/api/vm/getLogs/<id>', methods=['POST'])
+def logs_vm(id):
+    if user := DBHelper.authToken(session['token']):
+        if vm := VM.query.get(id):
+            if vm.owner == user.id and vm.vm_type == "docker":
+                if vm.ssh:
+                    logs = get_logs_docker(vm.ip, vm.socket, vm.ssh_pass, vm.ssh_user, ip_qmp=vm.ip_qmp, path=vm.path, vm_type=vm.vm_type)
+                else:
+                    logs = get_logs_docker(vm.ip, vm.socket, "", "", ip_qmp=vm.ip_qmp, path=vm.path, vm_type=vm.vm_type)
+
+                return jsonify({'message': 'VM started', 'status': 1, 'result': logs})
+
+@app.route('/api/vm/sendCommand/<id>', methods=['POST'])
+def send_command_vm(id):
+    if user := DBHelper.authToken(session['token']):
+        if vm := VM.query.get(id):
+            if vm.owner == user.id and vm.vm_type == "qemu":
+                data = request.json
+
+                global QMP_CLIENTS
+                try:
+                    if str(id) in QMP_CLIENTS:
+                        cl = QMP_CLIENTS[str(id)]["client"]
+                    else:
+                        try:
+                            cl = QEMUMonitorProtocol((vm.ip, vm.socket))
+                            cl.connect()
+
+                        except:
+                            return jsonify({'message': 'Ошибка', 'status': 0})
+                except:
+                    return jsonify({'message': 'Ошибка', 'status': 0})
+                
+                res = cl.cmd(data['command'], data['args'])
 
                 return jsonify({'message': 'VM started', 'status': 1, 'result': res})
 
@@ -493,7 +560,7 @@ def run_on_another(ip, port, password=None, login=None, keyfile=None, ip_qmp="0.
     if vm_type == "qemu":
         command = ['echo', f'"{password}" |' 'sudo -S', 'qemu-system-x86_64', '-nographic', '-cdrom', path, "-qmp", f"tcp:{ip_qmp}:{port},server=on,wait=off" ]
     elif vm_type == "docker":
-        command = ['echo', f'"{password}" |' 'sudo -S', 'docker', 'run', path]
+        command = ['echo', f'"{password}" |' 'sudo -S', 'docker', 'start', path]
         
     if login:
         ssh = paramiko.SSHClient()
@@ -515,9 +582,38 @@ def run_qemu(socket, ip_qmp="0.0.0.0", vm_type="qemu", path="ubuntu.iso"):
     if vm_type == "qemu":
         command = ['qemu-system-x86_64', '-nographic', '-cdrom', path, "-qmp", f"tcp:{ip_qmp}:{socket},server=on,wait=off"]
     elif vm_type == "docker":
-        command = ['docker', 'run', path]
+        command = ['docker', 'start', path]
         
     return command
+
+def stop_docker(ip, port, password=None, login=None, ip_qmp="0.0.0.0", vm_type="qemu", path="ubuntu.iso"):
+    if login:
+        command = ['echo', f'"{password}" |' 'sudo -S', 'docker', 'stop', path]
+
+        ssh = paramiko.SSHClient()
+        print(login, password)
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, username=login, password=password)
+        print(" ".join(command))
+        ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(" ".join(command),  get_pty=True)
+    else:
+        command = ['docker', 'stop', path]
+        pc.queue.append(command)
+
+def get_logs_docker(ip, port, password=None, login=None, ip_qmp="0.0.0.0", vm_type="qemu", path="ubuntu.iso"):
+    if login:
+        command = ["set", "enable-bracketed-paste", "off;", 'echo', f'"{password}" |' 'sudo -S', 'docker', 'logs', path]
+
+        ssh = paramiko.SSHClient()
+        print(login, password)
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, username=login, password=password)
+        print(" ".join(command))
+        ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(" ".join(command),  get_pty=True)
+        return ssh_stdout.readlines()
+    else:
+        command = ['docker', 'logs', path]
+        return subprocess.run(command, text=True, capture_output=True)
 
 if __name__ == '__main__':
     with app.app_context():
