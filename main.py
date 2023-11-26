@@ -51,11 +51,11 @@ def vms():
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def index(path):
-    return app.send_static_file('idnex.html')
+    return app.send_static_file('index.html')
 
 @app.errorhandler(404)
 def not_found(e):
-    return app.send_static_file('idnex.html')
+    return app.send_static_file('index.html')
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -622,4 +622,4 @@ if __name__ == '__main__':
     pc = SubProccesRunner()
     pc.start()
 
-    socketio.run(app)
+    socketio.run(app, host="0.0.0.0", port=80)
